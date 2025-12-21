@@ -1,0 +1,50 @@
+{
+  "name": "sikiopipe",
+  "version": "0.1.0",
+  "author": "leiko57",
+  "type": "module",
+  "description": "Zero‑copy‑ish IPC & RPC between Web Workers and Node.js worker_threads with SAB+Atomics fast path and postMessage fallback.",
+  "license": "AGPL-3.0-only",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/leiko57/SikioPipe.git"
+  },
+  "sideEffects": false,
+  "engines": {
+    "node": ">=20"
+  },
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js",
+      "default": "./dist/index.js"
+    },
+    "./node": {
+      "types": "./dist/index.node.d.ts",
+      "import": "./dist/index.node.js",
+      "default": "./dist/index.node.js"
+    },
+    "./browser": {
+      "types": "./dist/index.browser.d.ts",
+      "import": "./dist/index.browser.js",
+      "default": "./dist/index.browser.js"
+    }
+  },
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "prepack": "npm run build",
+    "typecheck": "tsc -p tsconfig.json --noEmit"
+  },
+  "dependencies": {
+    "@msgpack/msgpack": "^3.1.2"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.2",
+    "typescript": "^5.7.2"
+  }
+}
+
+
