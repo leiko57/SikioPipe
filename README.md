@@ -1,6 +1,6 @@
 # SikioPipe
 
-![NPM Version](https://img.shields.io/npm/v/sikiopipe?style=flat-square&color=blue) ![License](https://img.shields.io/github/license/leiko57/SikioPipe?style=flat-square) ![TypeScript](https://img.shields.io/badge/built_with-TypeScript-3178c6?style=flat-square) ![Targets](https://img.shields.io/badge/targets-web%20workers%20%7C%20worker_threads-purple?style=flat-square) ![Size](https://img.shields.io/bundlephobia/minzip/sikiopipe?style=flat-square&label=minzipped)
+![NPM Version](https://img.shields.io/npm/v/sikiopipe?style=flat-square&color=blue) ![License](https://img.shields.io/github/license/leiko57/SikioPipe?style=flat-square) ![TypeScript](https://img.shields.io/badge/built_with-TypeScript-3178c6?style=flat-square) ![Targets](https://img.shields.io/badge/targets-web%20workers%20%7C%20worker_threads-purple?style=flat-square)
 
 Zero‑copy‑ish IPC & RPC between Web Workers and Node.js `worker_threads` with a SharedArrayBuffer + Atomics fast path and `postMessage` fallback.
 
