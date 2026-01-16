@@ -1,5 +1,6 @@
 export class AsyncQueue<T> {
-  private readonly values: T[] = [];
+  private values: T[] = [];
+  private head = 0;
   private readonly waiters: Array<{
     resolve: (value: T) => void;
     reject: (err: unknown) => void;
@@ -21,8 +22,12 @@ export class AsyncQueue<T> {
 
   shift(signal?: AbortSignal): Promise<T> {
     if (signal?.aborted) return Promise.reject(new DOMException("Aborted", "AbortError"));
-    const value = this.values.shift();
-    if (value !== undefined) return Promise.resolve(value);
+    if (this.head < this.values.length) {
+      const value = this.values[this.head];
+      this.head += 1;
+      this.compactValues();
+      if (value !== undefined) return Promise.resolve(value);
+    }
     if (this.closedErr) return Promise.reject(this.closedErr);
     return new Promise<T>((resolve, reject) => {
       const waiter = { resolve, reject, signal } as (typeof this.waiters)[number];
@@ -46,27 +51,38 @@ export class AsyncQueue<T> {
       waiter.reject(this.closedErr);
     }
     this.values.length = 0;
+    this.head = 0;
   }
 
   size() {
-    return this.values.length;
+    return this.values.length - this.head;
   }
 
   stats() {
     return {
-      size: this.values.length,
+      size: this.values.length - this.head,
       waiters: this.waiters.length,
     };
   }
 
   drain(): T[] {
-    return this.values.splice(0);
+    const out = this.values.slice(this.head);
+    this.values.length = 0;
+    this.head = 0;
+    return out;
   }
 
   private removeWaiter(waiter: (typeof this.waiters)[number]) {
     const idx = this.waiters.indexOf(waiter);
     if (idx >= 0) this.waiters.splice(idx, 1);
     if (waiter.abortListener && waiter.signal) waiter.signal.removeEventListener("abort", waiter.abortListener);
+  }
+
+  private compactValues() {
+    if (this.head < 1024) return;
+    if (this.head * 2 < this.values.length) return;
+    this.values = this.values.slice(this.head);
+    this.head = 0;
   }
 }
 

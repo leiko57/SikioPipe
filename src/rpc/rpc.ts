@@ -1,12 +1,13 @@
 import type { Connection } from "../endpoint/connection.js";
 import { MessageKind } from "../protocol/kinds.js";
-import { defaultCodec, type Codec } from "./codec.js";
-import { STREAM_REF_KEY, StreamReceiver, StreamSender, isStreamRef, makeStreamRef } from "./stream.js";
+import { type Codec, defaultCodec } from "./codec.js";
+import { type BorrowedStreamChunk, isStreamRef, makeStreamRef, STREAM_REF_KEY, StreamReceiver, StreamSender } from "./stream.js";
 
 export type RpcOptions = {
   codec?: Codec;
   streamWindow?: number;
   callTimeoutMs?: number;
+  streamBorrowed?: boolean;
 };
 
 type CallOptions = {
@@ -19,8 +20,17 @@ export type Remote<T> = {
   [K in keyof T]: T[K] extends (...args: infer A) => infer R ? (...args: A) => RemoteReturn<R> : never;
 };
 
+type RemoteBorrowedReturn<R> = R extends AsyncIterable<Uint8Array>
+  ? AsyncIterable<BorrowedStreamChunk>
+  : Promise<Awaited<R>>;
+
+export type RemoteBorrowed<T> = {
+  [K in keyof T]: T[K] extends (...args: infer A) => infer R ? (...args: A) => RemoteBorrowedReturn<R> : never;
+};
+
 export type RpcClient = {
   wrap<T>(): Remote<T>;
+  wrapBorrowed<T>(): RemoteBorrowed<T>;
   getStats(): RpcStats;
 };
 
@@ -35,12 +45,24 @@ export type RpcStats = {
   outboundStreams: number;
 };
 
+type PendingCall = {
+  resolve: (value: unknown) => void;
+  reject: (err: unknown) => void;
+  signal?: AbortSignal;
+  abortListener?: () => void;
+  outboundStreamIds: number[];
+  timeoutId?: ReturnType<typeof setTimeout>;
+};
+
 export function rpc(conn: Connection, opts: RpcOptions = {}): RpcClient & RpcServer {
   const core = new RpcCore(conn, opts);
   keepRpcCoreAlive(conn, core);
   return {
     wrap<T>() {
       return core.wrap<T>();
+    },
+    wrapBorrowed<T>() {
+      return core.wrapBorrowed<T>();
     },
     expose(impl: Record<string, unknown>) {
       core.expose(impl);
@@ -51,11 +73,19 @@ export function rpc(conn: Connection, opts: RpcOptions = {}): RpcClient & RpcSer
   };
 }
 
-const RPC_CORE_KEY: unique symbol = Symbol.for("sikiopipe:rpcCore") as any;
+const RPC_CORE_KEY = Symbol.for("sikiopipe:rpcCore");
+
+type RpcCoreHolder = {
+  [key: symbol]: RpcCore[] | undefined;
+};
 
 function keepRpcCoreAlive(conn: Connection, core: RpcCore) {
-  const c = conn as any;
-  const list: RpcCore[] = (c[RPC_CORE_KEY] ??= []);
+  const holder = conn as Connection & RpcCoreHolder;
+  let list = holder[RPC_CORE_KEY];
+  if (!list) {
+    list = [];
+    holder[RPC_CORE_KEY] = list;
+  }
   list.push(core);
 }
 
@@ -64,22 +94,13 @@ class RpcCore {
   private readonly codec: Codec;
   private readonly streamWindow: number;
   private readonly callTimeoutMs: number;
+  private readonly inboundBorrowed: boolean;
   private readonly sideBit: number;
   private callSeq = 1;
   private streamSeq = 1;
   private impl: Record<string, unknown> | null = null;
 
-  private readonly pendingCalls = new Map<
-    number,
-    {
-      resolve: (value: unknown) => void;
-      reject: (err: unknown) => void;
-      signal?: AbortSignal;
-      abortListener?: () => void;
-      outboundStreamIds: number[];
-      timeoutId?: ReturnType<typeof setTimeout>;
-    }
-  >();
+  private readonly pendingCalls = new Map<number, PendingCall>();
 
   private readonly activeCalls = new Map<number, AbortController>();
   private readonly inboundStreams = new Map<number, StreamReceiver>();
@@ -90,6 +111,7 @@ class RpcCore {
     this.codec = opts.codec ?? defaultCodec;
     this.streamWindow = opts.streamWindow ?? 8;
     this.callTimeoutMs = opts.callTimeoutMs ?? 0;
+    this.inboundBorrowed = opts.streamBorrowed ?? false;
     this.sideBit = conn.role === "client" ? 0 : 1;
     void this.loopCalls();
     void this.loopResolve();
@@ -115,21 +137,28 @@ class RpcCore {
   }
 
   wrap<T>(): Remote<T> {
-    const self = this;
+    return this.wrapInternal(false) as Remote<T>;
+  }
+
+  wrapBorrowed<T>(): RemoteBorrowed<T> {
+    return this.wrapInternal(true) as RemoteBorrowed<T>;
+  }
+
+  private wrapInternal(borrowed: boolean) {
     const proxy = new Proxy(
       {},
       {
-        get(_target, prop) {
+        get: (_target, prop) => {
           if (prop === "then") return undefined;
           if (typeof prop !== "string") return undefined;
-          return (...args: unknown[]) => self.call(prop, args);
+          return (...args: unknown[]) => this.call(prop, args, borrowed);
         },
       },
     );
-    return proxy as unknown as Remote<T>;
+    return proxy;
   }
 
-  private call(method: string, args: unknown[]) {
+  private call<TBorrowed extends boolean>(method: string, args: unknown[], borrowed: TBorrowed) {
     const { callArgs, callOptions } = splitCallOptions(args);
     const callId = this.nextCallId();
     const timeoutMs = this.callTimeoutMs;
@@ -138,7 +167,7 @@ class RpcCore {
     if (!signal && timeoutMs > 0) {
       const timeoutController = new AbortController();
       timeoutId = setTimeout(() => {
-        timeoutController?.abort(new Error("RPC timeout"));
+        timeoutController.abort(new Error("RPC timeout"));
       }, timeoutMs);
       signal = timeoutController.signal;
     }
@@ -151,7 +180,9 @@ class RpcCore {
         this.outboundStreams.set(streamId, sender);
         void sender
           .start(a, signal ? { signal } : undefined)
-          .catch(() => undefined)
+          .catch(() => {
+            return undefined;
+          })
           .finally(() => {
             this.outboundStreams.delete(streamId);
           });
@@ -162,18 +193,20 @@ class RpcCore {
 
     const payload = this.codec.encode({ method, args: transformedArgs });
     const promise = new Promise<unknown>((resolve, reject) => {
-      this.pendingCalls.set(callId, {
+      const record: PendingCall = {
         resolve,
         reject,
         ...(signal ? { signal } : {}),
         ...(timeoutId ? { timeoutId } : {}),
         outboundStreamIds,
-      });
+      };
+      this.pendingCalls.set(callId, record);
     });
 
     if (signal) {
-      const rec = this.pendingCalls.get(callId)!;
       const abortListener = () => {
+        const rec = this.pendingCalls.get(callId);
+        if (!rec) return;
         this.pendingCalls.delete(callId);
         void this.conn.router.send({
           kind: MessageKind.RpcCancel,
@@ -197,6 +230,8 @@ class RpcCore {
         if (rec.timeoutId) clearTimeout(rec.timeoutId);
         rec.reject(rec.signal?.reason ?? new DOMException("Aborted", "AbortError"));
       };
+      const rec = this.pendingCalls.get(callId);
+      if (!rec) throw new Error("Pending call missing");
       rec.abortListener = abortListener;
       signal.addEventListener("abort", abortListener, { once: true });
     }
@@ -213,16 +248,18 @@ class RpcCore {
         },
         signal ? { signal } : undefined,
       )
-      .catch((e) => {
+      .catch((e: unknown) => {
         const rec = this.pendingCalls.get(callId);
         if (!rec) return;
         this.pendingCalls.delete(callId);
-        rec.abortListener && rec.signal?.removeEventListener("abort", rec.abortListener);
+        if (rec.abortListener && rec.signal) {
+          rec.signal.removeEventListener("abort", rec.abortListener);
+        }
         if (rec.timeoutId) clearTimeout(rec.timeoutId);
         rec.reject(e);
       });
 
-    return new RpcCallResult(promise, this, signal);
+    return new RpcCallResult(promise, this, signal, borrowed);
   }
 
   private nextCallId() {
@@ -241,13 +278,30 @@ class RpcCore {
     const recv = new StreamReceiver(this.conn.router, this.codec, streamId, this.streamWindow);
     this.inboundStreams.set(streamId, recv);
     recv.start();
-    const self = this;
+    const inboundStreams = this.inboundStreams;
     return (async function* () {
       try {
         yield* recv.iter(signal ? { signal } : undefined);
       } finally {
         recv.cancel();
-        self.inboundStreams.delete(streamId);
+        inboundStreams.delete(streamId);
+      }
+    })();
+  }
+
+  openInboundStreamBorrowed(streamId: number, signal?: AbortSignal): AsyncIterable<BorrowedStreamChunk> {
+    const existing = this.inboundStreams.get(streamId);
+    if (existing) return existing.iterBorrowed(signal ? { signal } : undefined);
+    const recv = new StreamReceiver(this.conn.router, this.codec, streamId, this.streamWindow);
+    this.inboundStreams.set(streamId, recv);
+    recv.start();
+    const inboundStreams = this.inboundStreams;
+    return (async function* () {
+      try {
+        yield* recv.iterBorrowed(signal ? { signal } : undefined);
+      } finally {
+        recv.cancel();
+        inboundStreams.delete(streamId);
       }
     })();
   }
@@ -269,7 +323,9 @@ class RpcCore {
         aux: 0,
         payload: new Uint8Array(0),
       })
-      .catch(() => undefined);
+      .catch(() => {
+        return undefined;
+      });
   }
 
   private async loopResolve() {
@@ -280,15 +336,17 @@ class RpcCore {
           const value = this.codec.decode(frame.payload);
           if (!rec) continue;
           this.pendingCalls.delete(frame.id);
-          rec.abortListener && rec.signal?.removeEventListener("abort", rec.abortListener);
+          if (rec.abortListener && rec.signal) {
+            rec.signal.removeEventListener("abort", rec.abortListener);
+          }
           if (rec.timeoutId) clearTimeout(rec.timeoutId);
           rec.resolve(value);
-        } catch (e) {
+        } catch (err) {
           const rec = this.pendingCalls.get(frame.id);
           if (rec) {
             this.pendingCalls.delete(frame.id);
             if (rec.timeoutId) clearTimeout(rec.timeoutId);
-            rec.reject(e);
+            rec.reject(err);
           }
         } finally {
           frame.release();
@@ -302,12 +360,25 @@ class RpcCore {
   private async loopReject() {
     try {
       for await (const frame of this.conn.router.recv(MessageKind.RpcReject)) {
+        const rec = this.pendingCalls.get(frame.id);
         try {
-          const rec = this.pendingCalls.get(frame.id);
-          const value = this.codec.decode(frame.payload);
           if (!rec) continue;
+          let value: unknown;
+          try {
+            value = this.codec.decode(frame.payload);
+          } catch (err) {
+            this.pendingCalls.delete(frame.id);
+            if (rec.abortListener && rec.signal) {
+              rec.signal.removeEventListener("abort", rec.abortListener);
+            }
+            if (rec.timeoutId) clearTimeout(rec.timeoutId);
+            rec.reject(toError(err));
+            continue;
+          }
           this.pendingCalls.delete(frame.id);
-          rec.abortListener && rec.signal?.removeEventListener("abort", rec.abortListener);
+          if (rec.abortListener && rec.signal) {
+            rec.signal.removeEventListener("abort", rec.abortListener);
+          }
           if (rec.timeoutId) clearTimeout(rec.timeoutId);
           rec.reject(toError(value));
         } finally {
@@ -341,21 +412,33 @@ class RpcCore {
         const controller = new AbortController();
         this.activeCalls.set(callId, controller);
         try {
-          const msg = this.codec.decode(frame.payload) as any;
-          const method = String(msg?.method ?? "");
-          const rawArgs = Array.isArray(msg?.args) ? msg.args : [];
-          const args = rawArgs.map((a: unknown) => {
+          const msg = this.codec.decode(frame.payload);
+          const msgRecord = isRecord(msg) ? msg : {};
+          const methodValue = msgRecord.method;
+          const method =
+            typeof methodValue === "string" ||
+            typeof methodValue === "number" ||
+            typeof methodValue === "boolean" ||
+            typeof methodValue === "bigint" ||
+            typeof methodValue === "symbol"
+              ? String(methodValue)
+              : "";
+          const rawArgsValue = msgRecord.args;
+          const rawArgs = isUnknownArray(rawArgsValue) ? rawArgsValue : [];
+          const args = rawArgs.map((a) => {
             if (isStreamRef(a)) {
-              const streamId = (a as any)[STREAM_REF_KEY] as number;
-              return this.openInboundStream(streamId, controller.signal);
+              const streamId = a[STREAM_REF_KEY];
+              return this.inboundBorrowed
+                ? this.openInboundStreamBorrowed(streamId, controller.signal)
+                : this.openInboundStream(streamId, controller.signal);
             }
             return a;
           });
           const impl = this.impl;
           if (!impl) throw new Error("No RPC implementation");
-          const fn = (impl as any)[method];
+          const fn = impl[method];
           if (typeof fn !== "function") throw new Error(`Unknown method: ${method}`);
-          const result = fn(...args, { signal: controller.signal });
+          const result = (fn as (...args: unknown[]) => unknown)(...args, { signal: controller.signal });
 
           if (isAsyncIterableOfUint8(result)) {
             const streamId = this.nextStreamId();
@@ -363,7 +446,9 @@ class RpcCore {
             this.outboundStreams.set(streamId, sender);
             void sender
               .start(result, { signal: controller.signal })
-              .catch(() => undefined)
+              .catch(() => {
+                return undefined;
+              })
               .finally(() => {
                 this.outboundStreams.delete(streamId);
               });
@@ -389,8 +474,8 @@ class RpcCore {
             aux: 0,
             payload,
           });
-        } catch (e) {
-          const payload = this.codec.encode(serializeError(e));
+        } catch (err) {
+          const payload = this.codec.encode(serializeError(err));
           await this.conn.router.send({
             kind: MessageKind.RpcReject,
             id: callId,
@@ -470,20 +555,24 @@ class RpcCore {
   }
 }
 
-class RpcCallResult<T> implements Promise<T>, AsyncIterable<Uint8Array> {
+class RpcCallResult<T, B extends boolean>
+  implements Promise<T>, AsyncIterable<B extends true ? BorrowedStreamChunk : Uint8Array>
+{
   readonly [Symbol.toStringTag] = "RpcCallResult";
   private readonly promise: Promise<T>;
   private readonly core: RpcCore;
   private readonly signal: AbortSignal | undefined;
+  private readonly borrowed: B;
   private aborted = false;
   private cancelSent = false;
   private cancelScheduled = false;
   private streamId: number | null = null;
 
-  constructor(promise: Promise<any>, core: RpcCore, signal?: AbortSignal) {
+  constructor(promise: Promise<T>, core: RpcCore, signal: AbortSignal | undefined, borrowed: B) {
     this.promise = promise;
     this.core = core;
     this.signal = signal;
+    this.borrowed = borrowed;
     if (this.signal) {
       this.signal.addEventListener(
         "abort",
@@ -505,14 +594,16 @@ class RpcCallResult<T> implements Promise<T>, AsyncIterable<Uint8Array> {
     if (this.cancelScheduled) return;
     this.cancelScheduled = true;
     void this.promise
-      .then((value: any) => {
+      .then((value) => {
         if (!this.aborted || this.cancelSent) return;
         if (!isStreamRef(value)) return;
-        const streamId = value[STREAM_REF_KEY] as number;
+        const streamId = value[STREAM_REF_KEY];
         this.streamId = streamId;
         this.cancelStream(streamId);
       })
-      .catch(() => undefined);
+      .catch(() => {
+        return undefined;
+      });
   }
 
   private cancelStream(streamId: number) {
@@ -522,67 +613,72 @@ class RpcCallResult<T> implements Promise<T>, AsyncIterable<Uint8Array> {
   }
 
   then<TResult1 = T, TResult2 = never>(
-    onfulfilled?: ((value: T) => TResult1 | PromiseLike<TResult1>) | null | undefined,
-    onrejected?: ((reason: any) => TResult2 | PromiseLike<TResult2>) | null | undefined,
+    onfulfilled?: ((value: T) => TResult1 | PromiseLike<TResult1>) | null,
+    onrejected?: ((reason: unknown) => TResult2 | PromiseLike<TResult2>) | null,
   ): Promise<TResult1 | TResult2> {
-    return this.promise.then(onfulfilled as any, onrejected as any);
+    return this.promise.then(onfulfilled, onrejected);
   }
 
-  catch<TResult = never>(
-    onrejected?: ((reason: any) => TResult | PromiseLike<TResult>) | null | undefined,
-  ): Promise<T | TResult> {
-    return this.promise.catch(onrejected as any);
+  catch<TResult = never>(onrejected?: ((reason: unknown) => TResult | PromiseLike<TResult>) | null): Promise<T | TResult> {
+    return this.promise.catch(onrejected);
   }
 
-  finally(onfinally?: (() => void) | null | undefined): Promise<T> {
-    return this.promise.finally(onfinally as any);
+  finally(onfinally?: (() => void) | null): Promise<T> {
+    return this.promise.finally(onfinally);
   }
 
-  [Symbol.asyncIterator](): AsyncIterator<Uint8Array> {
+  [Symbol.asyncIterator](): AsyncIterator<B extends true ? BorrowedStreamChunk : Uint8Array> {
     const signal = this.signal;
-    let inner: AsyncIterator<Uint8Array> | null = null;
-    let init: Promise<AsyncIterator<Uint8Array>> | null = null;
+    let inner: AsyncIterator<B extends true ? BorrowedStreamChunk : Uint8Array> | null = null;
+    let init: Promise<AsyncIterator<B extends true ? BorrowedStreamChunk : Uint8Array>> | null = null;
 
     const getInner = async () => {
       if (inner) return inner;
       if (!init) {
         init = (async () => {
-          const value: any = await this.promise;
+          const value = await this.promise;
           if (!isStreamRef(value)) throw new TypeError("RPC result is not a stream");
-          const streamId = value[STREAM_REF_KEY] as number;
+          const streamId = value[STREAM_REF_KEY];
           this.streamId = streamId;
           if (this.aborted) {
             this.cancelStream(streamId);
             throw new DOMException("Aborted", "AbortError");
           }
-          inner = this.core.openInboundStream(streamId, signal)[Symbol.asyncIterator]();
+          inner = (this.borrowed
+            ? this.core.openInboundStreamBorrowed(streamId, signal)
+            : this.core.openInboundStream(streamId, signal))[Symbol.asyncIterator]() as AsyncIterator<
+            B extends true ? BorrowedStreamChunk : Uint8Array
+          >;
           return inner;
         })();
       }
       return await init;
     };
 
-    const abortNow = async (): Promise<never> => {
+    const abortNow = (): Promise<never> => {
       this.markAborted();
       if (inner && typeof inner.return === "function") {
-        void inner.return(undefined as any).catch(() => undefined);
+        void inner.return(undefined).catch(() => {
+          return undefined;
+        });
       }
-      throw new DOMException("Aborted", "AbortError");
+      return Promise.reject(new DOMException("Aborted", "AbortError"));
     };
 
-    const selfIterator: AsyncIterator<Uint8Array> & AsyncIterable<Uint8Array> = {
+    const selfIterator: AsyncIterator<B extends true ? BorrowedStreamChunk : Uint8Array> &
+      AsyncIterable<B extends true ? BorrowedStreamChunk : Uint8Array> = {
       async next() {
         if (signal?.aborted) return await abortNow();
         const it = await getInner();
         if (signal?.aborted) return await abortNow();
         return await it.next();
       },
-      async return(value?: any) {
+      async return(value?: B extends true ? BorrowedStreamChunk : Uint8Array) {
         const it = await getInner().catch(() => null);
         if (it && typeof it.return === "function") return await it.return(value);
-        return { done: true, value } as IteratorReturnResult<Uint8Array>;
+        return { done: true, value } as IteratorReturnResult<B extends true ? BorrowedStreamChunk : Uint8Array>;
       },
-      async throw(err?: any) {
+      async throw(err?: unknown) {
         const it = await getInner().catch(() => null);
         if (it && typeof it.throw === "function") return await it.throw(err);
         throw err;
@@ -599,41 +695,68 @@ class RpcCallResult<T> implements Promise<T>, AsyncIterable<Uint8Array> {
 function splitCallOptions(args: unknown[]): { callArgs: unknown[]; callOptions: CallOptions } {
   if (args.length === 0) return { callArgs: args, callOptions: {} };
   const last = args[args.length - 1];
-  if (typeof last === "object" && last !== null && "signal" in (last as any)) {
-    const signal = (last as any).signal;
-    if (signal instanceof AbortSignal) {
-      return { callArgs: args.slice(0, -1), callOptions: { signal } };
-    }
+  const signal = getAbortSignal(last);
+  if (signal) {
+    return { callArgs: args.slice(0, -1), callOptions: { signal } };
   }
   return { callArgs: args, callOptions: {} };
 }
 
 function isAsyncIterableOfUint8(value: unknown): value is AsyncIterable<Uint8Array> {
-  return typeof value === "object" && value !== null && typeof (value as any)[Symbol.asyncIterator] === "function";
+  if (!isRecord(value)) return false;
+  const iterator = value[Symbol.asyncIterator];
+  return typeof iterator === "function";
 }
 
 function serializeError(err: unknown) {
   if (err instanceof Error) return { name: err.name, message: err.message, stack: err.stack ?? "" };
-  if (typeof err === "object" && err !== null) {
-    const name = typeof (err as any).name === "string" ? (err as any).name : "Error";
-    const message = typeof (err as any).message === "string" ? (err as any).message : String(err);
-    const stack = typeof (err as any).stack === "string" ? (err as any).stack : "";
+  if (isRecord(err)) {
+    const name = typeof err.name === "string" ? err.name : "Error";
+    const message = typeof err.message === "string" ? err.message : stringifyValue(err);
+    const stack = typeof err.stack === "string" ? err.stack : "";
     return { name, message, stack };
   }
-  return { name: "Error", message: String(err), stack: "" };
+  return { name: "Error", message: stringifyValue(err), stack: "" };
 }
 
 function toError(value: unknown) {
   if (value instanceof Error) return value;
-  if (typeof value === "object" && value !== null) {
-    const name = typeof (value as any).name === "string" ? (value as any).name : "Error";
-    const message = typeof (value as any).message === "string" ? (value as any).message : JSON.stringify(value);
+  if (isRecord(value)) {
+    const name = typeof value.name === "string" ? value.name : "Error";
+    const message = typeof value.message === "string" ? value.message : stringifyValue(value);
     const e = new Error(message);
     e.name = name;
-    if (typeof (value as any).stack === "string") e.stack = (value as any).stack;
+    if (typeof value.stack === "string") e.stack = value.stack;
     return e;
   }
-  return new Error(String(value));
+  return new Error(stringifyValue(value));
+}
+
+function getAbortSignal(value: unknown): AbortSignal | null {
+  if (!isRecord(value)) return null;
+  const signal = value.signal;
+  return signal instanceof AbortSignal ? signal : null;
+}
+
+function isRecord(value: unknown): value is Record<PropertyKey, unknown> {
+  return typeof value === "object" && value !== null;
+}
+
+function isUnknownArray(value: unknown): value is unknown[] {
+  return Array.isArray(value);
+}
+
+function stringifyValue(value: unknown): string {
+  if (typeof value === "string") return value;
+  if (typeof value === "number" || typeof value === "boolean" || typeof value === "bigint") return String(value);
+  if (typeof value === "symbol") return value.toString();
+  if (typeof value === "function") return value.name ? `function ${value.name}` : "function";
+  try {
+    const json = JSON.stringify(value) as string | undefined;
+    return json === undefined ? Object.prototype.toString.call(value) : json;
+  } catch {
+    return Object.prototype.toString.call(value);
+  }
 }
 
 

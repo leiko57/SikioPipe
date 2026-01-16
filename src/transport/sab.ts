@@ -1,5 +1,5 @@
-import { MessageKind } from "../protocol/kinds.js";
 import { getPayloadCapacity } from "../protocol/header.js";
+import { MessageKind } from "../protocol/kinds.js";
 import { SabBlockPool } from "../sab/blockPool.js";
 import { SpscRing } from "../sab/spscRing.js";
 import type { IncomingFrame, OutgoingFrame, Transport } from "./createTransport.js";
@@ -23,6 +23,9 @@ type PortLike = {
 
 const SAB_SETUP = "sikiopipe:sabSetup";
 const SAB_ACK = "sikiopipe:sabAck";
+const debugSab =
+  typeof process !== "undefined" &&
+  (process.env.BENCH_DEBUG_SAB === "1" || process.env.SIKIOPIPE_DEBUG_SAB === "1");
 
 export type SabSetup = {
   blockSize: number;
@@ -38,13 +41,13 @@ export type SabSetup = {
 export async function sabClientHandshake(port: PortLike, blockSize: number, blockCount: number): Promise<SabSetup> {
   const setup = allocateSabSetup(blockSize, blockCount);
   port.postMessage({ t: SAB_SETUP, setup });
-  await waitFor(port, (msg) => isObj(msg) && msg.t === SAB_ACK);
+  await waitFor(port, isSabAckMessage);
   return setup;
 }
 
-export async function sabServerHandshake(port: PortLike, first?: any): Promise<SabSetup> {
-  const msg = first && isObj(first) && first.t === SAB_SETUP ? first : await waitFor(port, (m) => isObj(m) && m.t === SAB_SETUP);
-  const setup = (msg as { setup: SabSetup }).setup;
+export async function sabServerHandshake(port: PortLike, first?: unknown): Promise<SabSetup> {
+  const msg = first && isSabSetupMessage(first) ? first : await waitFor(port, isSabSetupMessage);
+  const setup = msg.setup;
   port.postMessage({ t: SAB_ACK });
   return setup;
 }
@@ -52,6 +55,9 @@ export async function sabServerHandshake(port: PortLike, first?: any): Promise<S
 export class SabTransport implements Transport {
   readonly kind = "sab" as const;
   readonly payloadCapacity: number;
+  private readonly role: "client" | "server";
+  private readonly debug: boolean;
+  private debugFrames = 0;
 
   private readonly sendFree: SpscRing;
   private readonly sendData: SpscRing;
@@ -78,6 +84,8 @@ export class SabTransport implements Transport {
   private recvBytes = 0;
 
   constructor(role: "client" | "server", setup: SabSetup) {
+    this.role = role;
+    this.debug = debugSab;
     const blockSize = setup.blockSize;
     const blockCount = setup.blockCount;
     const poolM2W = new SabBlockPool(setup.blocksM2W, blockSize, blockCount);
@@ -115,10 +123,11 @@ export class SabTransport implements Transport {
     await this.sendData.push(blockIndex, opts?.signal);
     this.sentFrames += 1;
     this.sentBytes += frame.payload.byteLength;
+    this.logDebug("send", blockIndex);
   }
 
   async *recv(opts?: { signal?: AbortSignal }): AsyncIterable<IncomingFrame> {
-    while (true) {
+    for (;;) {
       if (this.closed) throw new Error("Closed");
       const blockIndex = await this.recvData.pop(opts?.signal);
       const payload = this.recvPool.read(blockIndex, this.headerOut);
@@ -139,6 +148,7 @@ export class SabTransport implements Transport {
       };
       this.recvFrames += 1;
       this.recvBytes += payload.byteLength;
+      this.logDebug("recv", blockIndex);
       yield frame;
     }
   }
@@ -160,6 +170,32 @@ export class SabTransport implements Transport {
       recvBytes: this.recvBytes,
       freeOutgoing: this.sendFree.count(),
     };
+  }
+
+  debugState() {
+    return {
+      role: this.role,
+      sendFree: this.sendFree.state(),
+      sendData: this.sendData.state(),
+      recvData: this.recvData.state(),
+      recvFree: this.recvFree.state(),
+    };
+  }
+
+  private logDebug(label: string, blockIndex: number) {
+    if (!this.debug) return;
+    if (this.debugFrames >= 20) return;
+    this.debugFrames += 1;
+    const state = {
+      role: this.role,
+      label,
+      blockIndex,
+      sendFree: this.sendFree.state(),
+      sendData: this.sendData.state(),
+      recvData: this.recvData.state(),
+      recvFree: this.recvFree.state(),
+    };
+    console.log(`sab: ${JSON.stringify(state)}`);
   }
 }
 
@@ -193,10 +229,19 @@ function allocateSabSetup(blockSize: number, blockCount: number): SabSetup {
   };
 }
 
-async function waitFor(port: PortLike, predicate: (data: any) => boolean): Promise<any> {
+type SabSetupMessage = {
+  t: typeof SAB_SETUP;
+  setup: SabSetup;
+};
+
+type SabAckMessage = {
+  t: typeof SAB_ACK;
+};
+
+async function waitFor<T>(port: PortLike, predicate: (data: unknown) => data is T): Promise<T> {
   return new Promise((resolve) => {
     const handler = (evOrValue: unknown) => {
-      const data = isMessageEvent(evOrValue) ? (evOrValue as MessageEvent).data : evOrValue;
+      const data = isMessageEvent(evOrValue) ? evOrValue.data : evOrValue;
       if (!predicate(data)) return;
       removeListener(port, handler);
       resolve(data);
@@ -207,7 +252,9 @@ async function waitFor(port: PortLike, predicate: (data: any) => boolean): Promi
 
 function addListener(port: PortLike, handler: (value: unknown) => void) {
   if (typeof port.addEventListener === "function") {
-    const listener: EventListener = (ev) => handler(ev as MessageEvent);
+    const listener: EventListener = (ev) => {
+      handler(ev as MessageEvent<unknown>);
+    };
     (handler as unknown as { __listener?: EventListener }).__listener = listener;
     port.addEventListener("message", listener);
     return;
@@ -224,12 +271,20 @@ function removeListener(port: PortLike, handler: (value: unknown) => void) {
   port.off?.("message", handler);
 }
 
-function isObj(value: unknown): value is Record<string, any> {
+function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null;
 }
 
-function isMessageEvent(value: unknown): value is MessageEvent {
-  return isObj(value) && "data" in value;
+function isMessageEvent(value: unknown): value is MessageEvent<unknown> {
+  return isRecord(value) && "data" in value;
+}
+
+function isSabSetupMessage(value: unknown): value is SabSetupMessage {
+  return isRecord(value) && value.t === SAB_SETUP && "setup" in value;
+}
+
+function isSabAckMessage(value: unknown): value is SabAckMessage {
+  return isRecord(value) && value.t === SAB_ACK;
 }
 
 

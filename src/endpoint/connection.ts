@@ -21,7 +21,7 @@ export type Connection = {
 };
 
 export function isNodeLike() {
-  return typeof process !== "undefined" && typeof process.versions?.node === "string";
+  return typeof process !== "undefined" && typeof process.versions.node === "string";
 }
 
 export function isBrowser() {
@@ -64,6 +64,10 @@ type PortLike = {
   off?: (event: "message", listener: (value: unknown) => void) => void;
 };
 
+type GlobalWithPerformance = {
+  performance?: { now?: () => number };
+};
+
 const INIT = "sikiopipe:init";
 const ACK = "sikiopipe:ack";
 type AckMessage = {
@@ -87,12 +91,14 @@ export async function connectToWorkerLike(worker: WorkerLike, opts: ConnectOptio
     ackOpts = await waitForAck(port, opts.handshakeTimeoutMs);
   } catch (e) {
     port.close?.();
-    const terminate = (worker as unknown as { terminate?: () => unknown }).terminate;
-    if (typeof terminate === "function") {
-      try {
-        await terminate.call(worker);
-      } catch {}
-    }
+      const terminate = (worker as unknown as { terminate?: () => unknown }).terminate;
+      if (typeof terminate === "function") {
+        try {
+          await terminate.call(worker);
+        } catch (err) {
+          void err;
+        }
+      }
     throw e;
   }
   const transport = await createTransport(port, "client", ackOpts ?? opts);
@@ -127,7 +133,7 @@ function waitForAck(port: PortLike, timeoutMs?: number): Promise<ConnectOptions 
     }
     const handler = (value: unknown) => {
       if (isMessageEvent(value)) {
-        const data = value.data as unknown;
+        const data = value.data;
         if (isObj(data) && data.t === ACK) {
           const msg = data as AckMessage;
           removePortListener(port, handler);
@@ -159,7 +165,7 @@ function waitForInitAndGetPort(opts: ConnectOptions): Promise<{ port: PortLike; 
   return new Promise((resolve) => {
     const handler = (value: unknown) => {
       if (isMessageEvent(value)) {
-        const data = value.data as unknown;
+        const data = value.data;
         if (isObj(data) && data.t === INIT) {
           const port = (data as { port: PortLike }).port;
           const initOpts = (data as { opts?: ConnectOptions }).opts;
@@ -221,10 +227,16 @@ function createConnection(role: "client" | "server", transport: Transport, port:
   const control = startControl(
     router,
     opts,
-    (reason) => closeLocal(reason, false),
-    () => closeLocal("Ping timeout", true),
+    (reason) => {
+      closeLocal(reason, false);
+    },
+    () => {
+      closeLocal("Ping timeout", true);
+    },
   );
-  controlStop = control.stop;
+  controlStop = () => {
+    control.stop();
+  };
   return {
     role,
     transportKind: transport.kind,
@@ -244,7 +256,9 @@ function startControl(
 ) {
   const controller = new AbortController();
   const signal = controller.signal;
-  const heartbeat = startHeartbeat(router, opts, onPingTimeout, (ms) => router.recordLatency(ms));
+  const heartbeat = startHeartbeat(router, opts, onPingTimeout, (ms) => {
+    router.recordLatency(ms);
+  });
 
   const loopPing = async () => {
     try {
@@ -319,7 +333,6 @@ function startHeartbeat(
   let pingSeq = 1;
   let lastPingSeq = 0;
   let lastPingAt = 0;
-  let intervalId: ReturnType<typeof setInterval> | null = null;
   let timeoutId: ReturnType<typeof setTimeout> | null = null;
 
   const clearTimeoutTimer = () => {
@@ -352,13 +365,16 @@ function startHeartbeat(
         aux,
         payload: emptyPayload,
       })
-      .catch(() => undefined);
+      .catch(() => {
+        return undefined;
+      });
     scheduleTimeout();
   };
 
-  intervalId = setInterval(() => {
+  const intervalId = setInterval(() => {
     void sendPing();
   }, interval);
+
   void sendPing();
 
   return {
@@ -370,15 +386,16 @@ function startHeartbeat(
     },
     stop() {
       closed = true;
-      if (intervalId) clearInterval(intervalId);
+      clearInterval(intervalId);
       clearTimeoutTimer();
     },
   };
 }
 
 function nowMs() {
-  const perf = (globalThis as any).performance;
-  if (perf && typeof perf.now === "function") return perf.now();
+  const perf = (globalThis as GlobalWithPerformance).performance;
+  const now = perf?.now;
+  if (typeof now === "function") return now.call(perf);
   return Date.now();
 }
 
@@ -402,20 +419,28 @@ async function sendControlClose(router: FrameRouter, reason?: string) {
       aux: 0,
       payload: encodeCloseReason(reason),
     })
-    .catch(() => undefined);
+    .catch(() => {
+      return undefined;
+    });
 }
 
 function addGlobalListener(handler: (value: unknown) => void, _opts: ConnectOptions) {
   if (typeof self !== "undefined" && typeof (self as unknown as { addEventListener?: unknown }).addEventListener === "function") {
-    const listener: EventListener = (ev) => handler(ev as MessageEvent);
+    const listener: EventListener = (ev) => {
+      handler(ev as MessageEvent<unknown>);
+    };
     (handler as unknown as { __listener?: EventListener }).__listener = listener;
     (self as unknown as { addEventListener: (t: string, l: (ev: MessageEvent) => void) => void }).addEventListener("message", listener);
     return;
   }
   if (isNodeLike()) {
-    const listener = (value: unknown) => handler(value);
+    const listener = (value: unknown) => {
+      handler(value);
+    };
     (handler as unknown as { __nodeListener?: (v: unknown) => void }).__nodeListener = listener;
-    void import("node:worker_threads").then(({ parentPort }) => parentPort?.on("message", listener));
+    void import("node:worker_threads").then(({ parentPort }) => {
+      parentPort?.on("message", listener);
+    });
   }
 }
 
@@ -429,13 +454,19 @@ function removeGlobalListener(handler: (value: unknown) => void) {
   }
   if (isNodeLike()) {
     const listener = (handler as unknown as { __nodeListener?: (v: unknown) => void }).__nodeListener;
-    if (listener) void import("node:worker_threads").then(({ parentPort }) => parentPort?.off("message", listener));
+    if (listener) {
+      void import("node:worker_threads").then(({ parentPort }) => {
+        parentPort?.off("message", listener);
+      });
+    }
   }
 }
 
 function addPortListener(port: PortLike, handler: (value: unknown) => void) {
   if (typeof port.addEventListener === "function") {
-    const listener: EventListener = (ev) => handler(ev as MessageEvent);
+    const listener: EventListener = (ev) => {
+      handler(ev as MessageEvent<unknown>);
+    };
     (handler as unknown as { __listener?: EventListener }).__listener = listener;
     port.addEventListener("message", listener);
     return;
@@ -453,10 +484,18 @@ function removePortListener(port: PortLike, handler: (value: unknown) => void) {
 }
 
 function keepPortAlive(port: PortLike, enabled: boolean) {
-  if (!enabled) return () => {};
-  const handler = () => {};
+  if (!enabled) {
+    return () => {
+      return undefined;
+    };
+  }
+  const handler = () => {
+    return undefined;
+  };
   if (typeof port.addEventListener === "function") {
-    const listener: EventListener = () => {};
+    const listener: EventListener = () => {
+      return undefined;
+    };
     port.addEventListener("message", listener);
     port.ref?.();
     return () => {
@@ -482,7 +521,7 @@ function isObj(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null;
 }
 
-function isMessageEvent(value: unknown): value is MessageEvent {
+function isMessageEvent(value: unknown): value is MessageEvent<unknown> {
   return isObj(value) && "data" in value;
 }
 

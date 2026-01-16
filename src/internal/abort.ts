@@ -9,7 +9,9 @@ export function abortPromise(signal: AbortSignal): Promise<never> {
   return new Promise((_, reject) => {
     signal.addEventListener(
       "abort",
-      () => reject(abortError()),
+      () => {
+        reject(abortError());
+      },
       { once: true },
     );
   });

@@ -36,12 +36,12 @@ export function writeHeader(view: Uint32Array, wordOffset: number, h: FrameHeade
 }
 
 export function readHeader(view: Uint32Array, wordOffset: number, out: FrameHeaderOut): FrameHeaderOut {
-  out.kind = view[wordOffset + 0]! as MessageKind;
-  out.id = view[wordOffset + 1]! >>> 0;
-  out.streamId = view[wordOffset + 2]! >>> 0;
-  out.flags = view[wordOffset + 3]! >>> 0;
-  out.payloadLength = view[wordOffset + 4]! >>> 0;
-  out.aux = view[wordOffset + 5]! >>> 0;
+  out.kind = view[wordOffset + 0] as MessageKind;
+  out.id = (view[wordOffset + 1] as number) >>> 0;
+  out.streamId = (view[wordOffset + 2] as number) >>> 0;
+  out.flags = (view[wordOffset + 3] as number) >>> 0;
+  out.payloadLength = (view[wordOffset + 4] as number) >>> 0;
+  out.aux = (view[wordOffset + 5] as number) >>> 0;
   return out;
 }
 

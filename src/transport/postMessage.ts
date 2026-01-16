@@ -1,5 +1,5 @@
 import { AsyncQueue } from "../internal/asyncQueue.js";
-import { HEADER_BYTES, HEADER_WORDS, getPayloadCapacity, readHeader, writeHeader, type FrameHeaderOut } from "../protocol/header.js";
+import { type FrameHeaderOut, getPayloadCapacity, HEADER_BYTES, HEADER_WORDS, readHeader, writeHeader } from "../protocol/header.js";
 import { MessageKind } from "../protocol/kinds.js";
 import type { IncomingFrame, OutgoingFrame, Transport } from "./createTransport.js";
 
@@ -50,7 +50,7 @@ export class PostMessageTransport implements Transport {
   private recvBytes = 0;
 
   private readonly onMessage = (evOrValue: unknown) => {
-    const data = isMessageEvent(evOrValue) ? (evOrValue as MessageEvent).data : evOrValue;
+    const data = isMessageEvent(evOrValue) ? evOrValue.data : evOrValue;
     if (!(data instanceof ArrayBuffer)) return;
     if (data.byteLength < HEADER_BYTES) return;
     const u32 = new Uint32Array(data, 0, HEADER_WORDS);
@@ -62,7 +62,8 @@ export class PostMessageTransport implements Transport {
     }
 
     const payloadLength = this.headerOut.payloadLength;
-    if (payloadLength > this.payloadCapacity) {
+    const maxPayload = data.byteLength - HEADER_BYTES;
+    if (payloadLength > maxPayload) {
       this.returnBuffer(data);
       return;
     }
@@ -90,7 +91,9 @@ export class PostMessageTransport implements Transport {
     this.inbound.push(frame);
   };
 
-  private readonly onMessageListener: EventListener = (ev) => this.onMessage(ev as MessageEvent);
+  private readonly onMessageListener: EventListener = (ev) => {
+    this.onMessage(ev as MessageEvent<unknown>);
+  };
 
   constructor(port: PortLike, opts: PostMessageTransportOptions) {
     this.port = port;
@@ -111,29 +114,42 @@ export class PostMessageTransport implements Transport {
 
   async send(frame: OutgoingFrame, opts?: { signal?: AbortSignal }): Promise<void> {
     if (this.closed) throw new Error("Closed");
-    if (frame.payload.byteLength > this.payloadCapacity) throw new RangeError("Frame too large");
-
-    const buffer = await this.freeOutgoing.shift(opts?.signal);
-    const u32 = new Uint32Array(buffer, 0, HEADER_WORDS);
-    writeHeader(u32, 0, {
-      kind: frame.kind,
-      id: frame.id,
-      streamId: frame.streamId,
-      flags: frame.flags,
-      payloadLength: frame.payload.byteLength,
-      aux: frame.aux,
-    });
-    new Uint8Array(buffer, HEADER_BYTES, frame.payload.byteLength).set(frame.payload);
-
-    this.port.postMessage(buffer, [buffer]);
+    const payloadLength = frame.payload.byteLength;
+    if (payloadLength <= this.payloadCapacity) {
+      const buffer = await this.freeOutgoing.shift(opts?.signal);
+      const u32 = new Uint32Array(buffer, 0, HEADER_WORDS);
+      writeHeader(u32, 0, {
+        kind: frame.kind,
+        id: frame.id,
+        streamId: frame.streamId,
+        flags: frame.flags,
+        payloadLength,
+        aux: frame.aux,
+      });
+      new Uint8Array(buffer, HEADER_BYTES, payloadLength).set(frame.payload);
+      this.port.postMessage(buffer, [buffer]);
+    } else {
+      if (opts?.signal?.aborted) throw new DOMException("Aborted", "AbortError");
+      const buffer = new ArrayBuffer(HEADER_BYTES + payloadLength);
+      const u32 = new Uint32Array(buffer, 0, HEADER_WORDS);
+      writeHeader(u32, 0, {
+        kind: frame.kind,
+        id: frame.id,
+        streamId: frame.streamId,
+        flags: frame.flags,
+        payloadLength,
+        aux: frame.aux,
+      });
+      new Uint8Array(buffer, HEADER_BYTES, payloadLength).set(frame.payload);
+      this.port.postMessage(buffer, [buffer]);
+    }
     this.sentFrames += 1;
-    this.sentBytes += frame.payload.byteLength;
+    this.sentBytes += payloadLength;
   }
 
-  async sendTransfer(frame: OutgoingFrame, buffer: ArrayBuffer, opts?: { signal?: AbortSignal }): Promise<void> {
+  sendTransfer(frame: OutgoingFrame, buffer: ArrayBuffer, opts?: { signal?: AbortSignal }): Promise<void> {
     if (this.closed) throw new Error("Closed");
     if (opts?.signal?.aborted) throw new DOMException("Aborted", "AbortError");
-    if (frame.payload.byteLength > this.payloadCapacity) throw new RangeError("Frame too large");
     if (frame.payload.buffer !== buffer) throw new RangeError("Transfer buffer mismatch");
     if (frame.payload.byteOffset !== HEADER_BYTES) throw new RangeError("Invalid transfer payload offset");
     if (buffer.byteLength < HEADER_BYTES + frame.payload.byteLength) throw new RangeError("Invalid transfer buffer");
@@ -150,10 +166,11 @@ export class PostMessageTransport implements Transport {
     this.port.postMessage(buffer, [buffer]);
     this.sentFrames += 1;
     this.sentBytes += frame.payload.byteLength;
+    return Promise.resolve();
   }
 
   async *recv(opts?: { signal?: AbortSignal }): AsyncIterable<IncomingFrame> {
-    while (true) {
+    for (;;) {
       const frame = await this.inbound.shift(opts?.signal);
       yield frame;
     }
@@ -198,7 +215,7 @@ export class PostMessageTransport implements Transport {
   }
 }
 
-function isMessageEvent(value: unknown): value is MessageEvent {
+function isMessageEvent(value: unknown): value is MessageEvent<unknown> {
   return typeof value === "object" && value !== null && "data" in value;
 }
 

@@ -1,4 +1,4 @@
-import { HEADER_BYTES, HEADER_WORDS, readHeader, writeHeader, type FrameHeaderOut } from "../protocol/header.js";
+import { type FrameHeaderOut, HEADER_BYTES, readHeader, writeHeader } from "../protocol/header.js";
 import type { OutgoingFrame } from "../transport/createTransport.js";
 
 export class SabBlockPool {

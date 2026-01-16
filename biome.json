@@ -1,0 +1,16 @@
+{
+  "files": {
+    "includes": ["**", "!!**/dist"]
+  },
+  "linter": {
+    "enabled": true,
+    "rules": {
+      "suspicious": {
+        "noThenProperty": "off"
+      }
+    }
+  },
+  "formatter": {
+    "enabled": false
+  }
+}

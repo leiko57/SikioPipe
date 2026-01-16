@@ -4,7 +4,7 @@ export function asyncIterableFromReadableStream<T>(stream: ReadableStream<T>): A
       const reader = stream.getReader();
       let done = false;
       try {
-        while (true) {
+        for (;;) {
           const result = await reader.read();
           if (result.done) {
             done = true;
@@ -16,7 +16,9 @@ export function asyncIterableFromReadableStream<T>(stream: ReadableStream<T>): A
         if (!done) {
           try {
             await reader.cancel();
-          } catch {}
+          } catch (err) {
+            void err;
+          }
         }
         reader.releaseLock();
       }
@@ -43,7 +45,9 @@ export function readableStreamFromAsyncIterable<T>(iterable: AsyncIterable<T>): 
       if (typeof iterator.return === "function") {
         try {
           await iterator.return();
-        } catch {}
+        } catch (err) {
+          void err;
+        }
       }
     },
   });

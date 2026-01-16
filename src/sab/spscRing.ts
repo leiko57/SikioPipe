@@ -1,5 +1,45 @@
 import { abortPromise, throwIfAborted } from "../internal/abort.js";
 
+type AtomicsWithWaitAsync = typeof Atomics & { waitAsync?: (...args: unknown[]) => { value: Promise<string> | string } };
+
+const supportsBlockingWait = typeof Atomics !== "undefined" && typeof Atomics.wait === "function";
+const isBrowserWorker =
+  typeof self !== "undefined" &&
+  typeof (self as { postMessage?: unknown }).postMessage === "function" &&
+  typeof (self as { document?: unknown }).document === "undefined";
+const isNodeLike = typeof process !== "undefined" && typeof process.versions.node === "string";
+let useBlockingWait = supportsBlockingWait && isBrowserWorker;
+
+if (supportsBlockingWait && isNodeLike) {
+  void import("node:worker_threads")
+    .then((mod) => {
+      if (!mod.isMainThread) useBlockingWait = true;
+    })
+    .catch(() => {
+      return undefined;
+    });
+}
+
+const waitTick = () => new Promise<void>((resolve) => setTimeout(resolve, 0));
+
+async function waitOn(meta: Int32Array, index: number, value: number, signal?: AbortSignal) {
+  if (useBlockingWait && !signal && supportsBlockingWait) {
+    Atomics.wait(meta, index, value);
+    return;
+  }
+  const waitAsync = (Atomics as AtomicsWithWaitAsync).waitAsync;
+  if (typeof waitAsync === "function") {
+    const wait = waitAsync(meta, index, value);
+    await (signal ? Promise.race([wait.value, abortPromise(signal)]) : wait.value);
+    return;
+  }
+  if (signal) {
+    await Promise.race([waitTick(), abortPromise(signal)]);
+    return;
+  }
+  await waitTick();
+}
+
 export class SpscRing {
   readonly capacity: number;
   private readonly mask: number;
@@ -41,51 +81,52 @@ export class SpscRing {
     return (w - r) >>> 0;
   }
 
+  state() {
+    const w = Atomics.load(this.meta, 0) >>> 0;
+    const r = Atomics.load(this.meta, 1) >>> 0;
+    return { w, r, count: (w - r) >>> 0 };
+  }
+
   pushSync(value: number) {
     if (this.closed) return;
     const w = Atomics.load(this.meta, 0) >>> 0;
     const r = Atomics.load(this.meta, 1) >>> 0;
     if (((w - r) >>> 0) >= this.capacity) throw new Error("Ring is full");
     this.data[w & this.mask] = value | 0;
-    Atomics.store(this.meta, 0, ((w + 1) | 0) as number);
+    Atomics.store(this.meta, 0, (w + 1) | 0);
     Atomics.notify(this.meta, 0, 1);
   }
 
   async push(value: number, signal?: AbortSignal): Promise<void> {
-    while (true) {
+    for (;;) {
       if (this.closed) throw new Error("Closed");
       throwIfAborted(signal);
       const w = Atomics.load(this.meta, 0) >>> 0;
       const r = Atomics.load(this.meta, 1) >>> 0;
       if (((w - r) >>> 0) < this.capacity) {
         this.data[w & this.mask] = value | 0;
-        Atomics.store(this.meta, 0, ((w + 1) | 0) as number);
+        Atomics.store(this.meta, 0, (w + 1) | 0);
         Atomics.notify(this.meta, 0, 1);
         return;
       }
-      const wait = Atomics.waitAsync(this.meta, 1, r | 0);
-      if (wait.async) {
-        await (signal ? Promise.race([wait.value, abortPromise(signal)]) : wait.value);
-      }
+      await waitOn(this.meta, 1, r | 0, signal);
     }
   }
 
   async pop(signal?: AbortSignal): Promise<number> {
-    while (true) {
+    for (;;) {
       if (this.closed) throw new Error("Closed");
       throwIfAborted(signal);
       const w = Atomics.load(this.meta, 0) >>> 0;
       const r = Atomics.load(this.meta, 1) >>> 0;
       if (w !== r) {
-        const value = this.data[r & this.mask]!;
-        Atomics.store(this.meta, 1, ((r + 1) | 0) as number);
+        const value = this.data[r & this.mask];
+        if (value === undefined) throw new Error("Ring read failed");
+        Atomics.store(this.meta, 1, (r + 1) | 0);
         Atomics.notify(this.meta, 1, 1);
         return value | 0;
       }
-      const wait = Atomics.waitAsync(this.meta, 0, w | 0);
-      if (wait.async) {
-        await (signal ? Promise.race([wait.value, abortPromise(signal)]) : wait.value);
-      }
+      await waitOn(this.meta, 0, w | 0, signal);
     }
   }
 }

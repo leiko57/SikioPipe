@@ -12,7 +12,7 @@ export type TransferPayload = {
   readonly payload: Uint8Array;
 };
 
-export type ChannelOptions = {};
+export type ChannelOptions = Record<string, never>;
 
 export type Channel = {
   send(bytes: Uint8Array, opts?: { signal?: AbortSignal }): Promise<void>;
@@ -48,7 +48,6 @@ export function channel(_conn: Connection, _opts: ChannelOptions = {}): Channel 
       if (typeof transport.sendTransfer !== "function") throw new Error("sendTransfer is not supported");
       if (!(bytes.buffer instanceof ArrayBuffer)) throw new RangeError("Transfer payload must use ArrayBuffer");
       if (bytes.byteOffset !== HEADER_BYTES) throw new RangeError("Invalid transfer payload offset");
-      if (bytes.byteLength > transport.payloadCapacity) throw new RangeError("Frame too large");
       if (bytes.buffer.byteLength < HEADER_BYTES + bytes.byteLength) throw new RangeError("Invalid transfer buffer");
       await transport.sendTransfer(
         {
@@ -76,7 +75,9 @@ export function channel(_conn: Connection, _opts: ChannelOptions = {}): Channel 
       for await (const frame of _conn.router.recv(MessageKind.Data, opts)) {
         yield {
           bytes: frame.payload,
-          release: frame.release,
+          release: () => {
+            frame.release();
+          },
         };
       }
     },

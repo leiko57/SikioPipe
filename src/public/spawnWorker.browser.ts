@@ -8,7 +8,9 @@ export async function spawnWorker(url: URL, opts: SpawnWorkerOptions = {}) {
   const conn = await connectToWorkerLike(worker, opts);
   return Object.assign(conn, {
     worker,
-    terminate: () => worker.terminate(),
+    terminate: () => {
+      worker.terminate();
+    },
   });
 }
 

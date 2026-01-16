@@ -39,7 +39,7 @@ export class FrameRouter {
   async send(frame: OutgoingFrame, opts?: { signal?: AbortSignal }) {
     if (this.closed) throw new Error("Closed");
     const capacity = this.transport.payloadCapacity;
-    if (capacity > 0 && frame.payload.byteLength > capacity && (frame.flags & FrameFlags.Chunked) === 0) {
+    if (frame.payload.byteLength > capacity && (frame.flags & FrameFlags.Chunked) === 0) {
       await this.sendChunked(frame, capacity, opts);
       return;
     }
@@ -48,7 +48,7 @@ export class FrameRouter {
 
   async *recv(kind: MessageKind, opts?: { signal?: AbortSignal }): AsyncIterable<IncomingFrame> {
     const q = this.getQueue(kind);
-    while (true) {
+    for (;;) {
       const frame = await q.shift(opts?.signal);
       yield frame;
     }
@@ -206,12 +206,24 @@ export class FrameRouter {
         return;
       }
       const headerView = new Uint32Array(payload.buffer, payload.byteOffset, CHUNK_HEADER_WORDS);
-      const kind = headerView[0] ?? 0;
-      const id = headerView[1] ?? 0;
-      const originalStreamId = headerView[2] ?? 0;
-      const flags = headerView[3] ?? 0;
-      const aux = headerView[4] ?? 0;
-      const total = (headerView[5] ?? 0) >>> 0;
+      const kind = headerView[0];
+      const id = headerView[1];
+      const originalStreamId = headerView[2];
+      const flags = headerView[3];
+      const aux = headerView[4];
+      const totalWord = headerView[5];
+      if (
+        kind === undefined ||
+        id === undefined ||
+        originalStreamId === undefined ||
+        flags === undefined ||
+        aux === undefined ||
+        totalWord === undefined
+      ) {
+        frame.release();
+        return;
+      }
+      const total = totalWord >>> 0;
       const buffer = new Uint8Array(total);
       const available = payload.byteLength - CHUNK_HEADER_BYTES;
       let received = 0;

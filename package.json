@@ -1,6 +1,6 @@
 {
   "name": "sikiopipe",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "author": "leiko57",
   "type": "module",
   "description": "Zero‑copy‑ish IPC & RPC between Web Workers and Node.js worker_threads with SAB+Atomics fast path and postMessage fallback.",
@@ -36,15 +36,18 @@
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "prepack": "npm run build",
-    "typecheck": "tsc -p tsconfig.json --noEmit"
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "bench": "node bench/bench.mjs"
   },
   "dependencies": {
     "@msgpack/msgpack": "^3.1.2"
   },
   "devDependencies": {
     "@types/node": "^22.10.2",
-    "typescript": "^5.7.2"
+    "@eslint/js": "^9.37.0",
+    "eslint": "^9.37.0",
+    "typescript-eslint": "^8.0.0",
+    "typescript": "^5.7.2",
+    "mitata": "^1.0.0"
   }
 }
-
-
