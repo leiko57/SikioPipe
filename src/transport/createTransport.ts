@@ -44,6 +44,7 @@ export type Transport = {
 
 type PortLike = {
   postMessage(value: unknown, transfer?: readonly unknown[]): void;
+  start?: () => void;
   addEventListener?: (
     type: string,
     listener: EventListenerOrEventListenerObject,
@@ -90,15 +91,20 @@ export async function createTransport(port: PortLike, _role: "client" | "server"
     return new SabTransport("server", setup);
   }
 
-  const selected = await waitForSelectedTransport(port);
-  if (selected.kind === "sab") {
-    if (!isSabEligible()) throw new Error("SAB transport not available");
-    const setup = await sabServerHandshake(port, selected.first);
-    return new SabTransport("server", setup);
+  const selectedResult = await waitForSelectedTransport(port);
+  const selected = selectedResult.selection;
+  try {
+    if (selected.kind === "sab") {
+      if (!isSabEligible()) throw new Error("SAB transport not available");
+      const setup = await sabServerHandshake(port, selected.first);
+      return new SabTransport("server", setup);
+    }
+    const selectedBlockSize = normalizeBlockSize(selected.blockSize, postMessageBlockSize);
+    const selectedBlockCount = normalizeBlockCount(selected.blockCount ?? blockCount);
+    return new PostMessageTransport(port, { blockSize: selectedBlockSize, blockCount: selectedBlockCount });
+  } finally {
+    selectedResult.stop();
   }
-  const selectedBlockSize = normalizeBlockSize(selected.blockSize, postMessageBlockSize);
-  const selectedBlockCount = normalizeBlockCount(selected.blockCount ?? blockCount);
-  return new PostMessageTransport(port, { blockSize: selectedBlockSize, blockCount: selectedBlockCount });
 }
 
 function normalizeBlockSize(blockSize: number | undefined, fallback: number) {
@@ -115,24 +121,24 @@ function normalizeBlockCount(blockCount: number | undefined) {
   return v;
 }
 
-async function waitForSelectedTransport(port: PortLike): Promise<TransportSelection> {
+async function waitForSelectedTransport(
+  port: PortLike,
+): Promise<{ selection: TransportSelection; stop: () => void }> {
   return await new Promise((resolve) => {
     const handler: ListenerHandler = (evOrValue) => {
       const data = isMessageEvent(evOrValue) ? evOrValue.data : evOrValue;
       if (!isRecord(data)) return;
       if (data.t === "sikiopipe:sabSetup") {
-        removeListener(port, handler);
-        resolve({ kind: "sab", first: data });
+        resolve({ selection: { kind: "sab", first: data }, stop: () => removeListener(port, handler) });
         return;
       }
       if (data.t === "sikiopipe:transport" && data.kind === "postMessage") {
-        removeListener(port, handler);
         const blockSize = readNumber(data.blockSize);
         const blockCount = readNumber(data.blockCount);
         const selection: { kind: "postMessage"; blockSize?: number; blockCount?: number } = { kind: "postMessage" };
         if (blockSize !== undefined) selection.blockSize = blockSize;
         if (blockCount !== undefined) selection.blockCount = blockCount;
-        resolve(selection);
+        resolve({ selection, stop: () => removeListener(port, handler) });
       }
     };
     addListener(port, handler);
@@ -140,24 +146,29 @@ async function waitForSelectedTransport(port: PortLike): Promise<TransportSelect
 }
 
 function addListener(port: PortLike, handler: ListenerHandler) {
+  if (typeof port.on === "function") {
+    port.on("message", handler);
+    return;
+  }
   if (typeof port.addEventListener === "function") {
     const listener: EventListener = (ev) => {
       handler(ev as MessageEvent<unknown>);
     };
     handler.__listener = listener;
     port.addEventListener("message", listener);
-    return;
+    port.start?.();
   }
-  port.on?.("message", handler);
 }
 
 function removeListener(port: PortLike, handler: ListenerHandler) {
+  if (typeof port.off === "function") {
+    port.off("message", handler);
+    return;
+  }
   if (typeof port.removeEventListener === "function") {
     const listener = handler.__listener;
     if (listener) port.removeEventListener("message", listener);
-    return;
   }
-  port.off?.("message", handler);
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

@@ -1,8 +1,11 @@
 {
   "name": "sikiopipe",
-  "version": "0.1.1",
+  "version": "0.1.2-beta.0",
   "author": "leiko57",
   "type": "module",
+  "publishConfig": {
+    "tag": "beta"
+  },
   "description": "Zero‑copy‑ish IPC & RPC between Web Workers and Node.js worker_threads with SAB+Atomics fast path and postMessage fallback.",
   "license": "AGPL-3.0-only",
   "repository": {

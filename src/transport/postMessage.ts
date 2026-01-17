@@ -94,6 +94,7 @@ export class PostMessageTransport implements Transport {
   private readonly onMessageListener: EventListener = (ev) => {
     this.onMessage(ev as MessageEvent<unknown>);
   };
+  private readonly useEventTarget: boolean;
 
   constructor(port: PortLike, opts: PostMessageTransportOptions) {
     this.port = port;
@@ -104,9 +105,10 @@ export class PostMessageTransport implements Transport {
       this.freeOutgoing.push(new ArrayBuffer(this.blockSize));
     }
 
-    this.port.start?.();
-    if (typeof this.port.addEventListener === "function") {
-      this.port.addEventListener("message", this.onMessageListener);
+    this.useEventTarget = typeof this.port.addEventListener === "function" && typeof this.port.on !== "function";
+    if (this.useEventTarget) {
+      this.port.addEventListener?.("message", this.onMessageListener);
+      this.port.start?.();
     } else {
       this.port.on?.("message", this.onMessage);
     }
@@ -179,8 +181,8 @@ export class PostMessageTransport implements Transport {
   close(): void {
     if (this.closed) return;
     this.closed = true;
-    if (typeof this.port.removeEventListener === "function") {
-      this.port.removeEventListener("message", this.onMessageListener);
+    if (this.useEventTarget) {
+      this.port.removeEventListener?.("message", this.onMessageListener);
     } else {
       this.port.off?.("message", this.onMessage);
     }

@@ -7,18 +7,7 @@ const isBrowserWorker =
   typeof self !== "undefined" &&
   typeof (self as { postMessage?: unknown }).postMessage === "function" &&
   typeof (self as { document?: unknown }).document === "undefined";
-const isNodeLike = typeof process !== "undefined" && typeof process.versions.node === "string";
 let useBlockingWait = supportsBlockingWait && isBrowserWorker;
-
-if (supportsBlockingWait && isNodeLike) {
-  void import("node:worker_threads")
-    .then((mod) => {
-      if (!mod.isMainThread) useBlockingWait = true;
-    })
-    .catch(() => {
-      return undefined;
-    });
-}
 
 const waitTick = () => new Promise<void>((resolve) => setTimeout(resolve, 0));
 
@@ -98,7 +87,7 @@ export class SpscRing {
   }
 
   async push(value: number, signal?: AbortSignal): Promise<void> {
-    for (;;) {
+    for (; ;) {
       if (this.closed) throw new Error("Closed");
       throwIfAborted(signal);
       const w = Atomics.load(this.meta, 0) >>> 0;
@@ -114,7 +103,7 @@ export class SpscRing {
   }
 
   async pop(signal?: AbortSignal): Promise<number> {
-    for (;;) {
+    for (; ;) {
       if (this.closed) throw new Error("Closed");
       throwIfAborted(signal);
       const w = Atomics.load(this.meta, 0) >>> 0;
@@ -136,5 +125,4 @@ function normalizeCapacity(capacity: number) {
   if ((capacity & (capacity - 1)) !== 0) throw new RangeError("Capacity must be a power of two");
   return capacity;
 }
-
 

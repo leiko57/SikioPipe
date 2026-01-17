@@ -84,7 +84,6 @@ export async function connectToWorkerLike(worker: WorkerLike, opts: ConnectOptio
   worker.postMessage({ t: INIT, port: channel.port1, opts }, [channel.port1]);
 
   const port = channel.port2;
-  port.start?.();
 
   let ackOpts: ConnectOptions | undefined;
   try {
@@ -109,7 +108,6 @@ export async function connectToWorkerLike(worker: WorkerLike, opts: ConnectOptio
 export async function acceptConnection(opts: ConnectOptions = {}): Promise<Connection> {
   const init = await waitForInitAndGetPort(opts);
   const port = init.port;
-  port.start?.();
 
   const effectiveOpts = mergeOptions(opts, init.opts);
   port.postMessage({ t: ACK, opts: effectiveOpts });
@@ -463,24 +461,29 @@ function removeGlobalListener(handler: (value: unknown) => void) {
 }
 
 function addPortListener(port: PortLike, handler: (value: unknown) => void) {
+  if (typeof port.on === "function") {
+    port.on("message", handler);
+    return;
+  }
   if (typeof port.addEventListener === "function") {
     const listener: EventListener = (ev) => {
       handler(ev as MessageEvent<unknown>);
     };
     (handler as unknown as { __listener?: EventListener }).__listener = listener;
     port.addEventListener("message", listener);
-    return;
+    port.start?.();
   }
-  port.on?.("message", handler);
 }
 
 function removePortListener(port: PortLike, handler: (value: unknown) => void) {
+  if (typeof port.off === "function") {
+    port.off("message", handler);
+    return;
+  }
   if (typeof port.removeEventListener === "function") {
     const listener = (handler as unknown as { __listener?: EventListener }).__listener;
     if (listener) port.removeEventListener("message", listener);
-    return;
   }
-  port.off?.("message", handler);
 }
 
 function keepPortAlive(port: PortLike, enabled: boolean) {
@@ -492,22 +495,23 @@ function keepPortAlive(port: PortLike, enabled: boolean) {
   const handler = () => {
     return undefined;
   };
-  if (typeof port.addEventListener === "function") {
-    const listener: EventListener = () => {
-      return undefined;
-    };
-    port.addEventListener("message", listener);
-    port.ref?.();
-    return () => {
-      port.removeEventListener?.("message", listener);
-      port.unref?.();
-    };
-  }
   if (typeof port.on === "function") {
     port.on("message", handler);
     port.ref?.();
     return () => {
       port.off?.("message", handler);
+      port.unref?.();
+    };
+  }
+  if (typeof port.addEventListener === "function") {
+    const listener: EventListener = () => {
+      return undefined;
+    };
+    port.addEventListener("message", listener);
+    port.start?.();
+    port.ref?.();
+    return () => {
+      port.removeEventListener?.("message", listener);
       port.unref?.();
     };
   }

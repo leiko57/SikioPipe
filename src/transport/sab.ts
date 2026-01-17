@@ -251,24 +251,29 @@ async function waitFor<T>(port: PortLike, predicate: (data: unknown) => data is 
 }
 
 function addListener(port: PortLike, handler: (value: unknown) => void) {
+  if (typeof port.on === "function") {
+    port.on("message", handler);
+    return;
+  }
   if (typeof port.addEventListener === "function") {
     const listener: EventListener = (ev) => {
       handler(ev as MessageEvent<unknown>);
     };
     (handler as unknown as { __listener?: EventListener }).__listener = listener;
     port.addEventListener("message", listener);
-    return;
+    port.start?.();
   }
-  port.on?.("message", handler);
 }
 
 function removeListener(port: PortLike, handler: (value: unknown) => void) {
+  if (typeof port.off === "function") {
+    port.off("message", handler);
+    return;
+  }
   if (typeof port.removeEventListener === "function") {
     const listener = (handler as unknown as { __listener?: EventListener }).__listener;
     if (listener) port.removeEventListener("message", listener);
-    return;
   }
-  port.off?.("message", handler);
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
